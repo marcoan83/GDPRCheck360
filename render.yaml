@@ -3,7 +3,7 @@ services:
     name: gdprcheck360-api
     env: python
     region: frankfurt
-    plan: starter
+    plan: free   # <--- cambia da starter a free
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
