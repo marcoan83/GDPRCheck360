@@ -66,3 +66,7 @@ def get_scan(scan_id: str):
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "gdprcheck360-api"}
