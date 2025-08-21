@@ -62,3 +62,7 @@ def create_scan(req: ScanRequest, bg: BackgroundTasks):
 @app.get("/scan/{scan_id}", response_model=ScanResult)
 def get_scan(scan_id: str):
     return SCANS.get(scan_id) or ScanResult(scan_id=scan_id, status="error")
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
