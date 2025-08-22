@@ -3,12 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Literal, List, Dict, Any
-import uuid, time, os
-import httpx
+import uuid, time, httpx, os
 from bs4 import BeautifulSoup
+
+# ReportLab
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
 
 app = FastAPI(title="GDPRCheck360 API", version="0.3.0")
 
@@ -16,10 +17,6 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
-
-# ==========================
-# MODELS
-# ==========================
 
 class ScanRequest(BaseModel):
     url: HttpUrl
@@ -38,87 +35,40 @@ class ScanResult(BaseModel):
     score: int | None = None
     issues: List[Issue] | None = None
 
-# ==========================
-# STORAGE
-# ==========================
-
+# 🔹 In-memory scans
 scans: Dict[str, ScanResult] = {}
 
-# ==========================
-# SCAN FUNCTION
-# ==========================
+@app.post("/scan/start", response_model=ScanResult)
+async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+    scan_id = str(uuid.uuid4())
+    result = ScanResult(scan_id=scan_id, status="pending")
+    scans[scan_id] = result
+    background_tasks.add_task(run_scan, scan_id, str(req.url), req.depth)
+    return result
 
 async def run_scan(scan_id: str, url: str, depth: str):
     scans[scan_id].status = "running"
-    issues: List[Issue] = []
-    score = 100
+    await asyncio.sleep(2)  # simulazione delay
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url)
-            html = resp.text
-            soup = BeautifulSoup(html, "html.parser")
-
-            # SECURITY HEADERS
-            missing_headers = []
-            for h in ["Strict-Transport-Security", "Content-Security-Policy",
-                      "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy"]:
-                if h not in resp.headers:
-                    missing_headers.append(h)
-            if missing_headers:
-                issues.append(Issue(
-                    area="security", severity="low",
-                    title="Header di sicurezza mancanti",
-                    evidence={"missing": missing_headers},
-                    fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
-                ))
-                score -= 10
-
-            # PRIVACY POLICY
-            if soup.find("a", href=lambda x: x and "privacy" in x.lower()):
-                issues.append(Issue(
-                    area="policy", severity="medium",
-                    title="Informativa privacy trovata ma non validata",
-                    evidence={"policy_url": url + "/privacy"},
-                    fix_hint="Controlla titolare, finalità, basi giuridiche, tempi, diritti, DPO, trasferimenti."
-                ))
-                score -= 15
-
-            # CMP / COOKIE BANNER
-            if "cookie" in html.lower():
-                issues.append(Issue(
-                    area="cookies", severity="medium",
-                    title="CMP rilevata. Verifica blocco preventivo",
-                    evidence={"url": url},
-                    fix_hint="Attiva script solo dopo consenso esplicito."
-                ))
-                score -= 10
-
-        scans[scan_id].issues = issues
-        scans[scan_id].score = max(0, score)
-        scans[scan_id].status = "done"
-
-    except Exception as e:
-        scans[scan_id].status = "error"
-        scans[scan_id].issues = [Issue(
-            area="security", severity="high",
-            title="Errore interno scanner",
-            evidence={"error": str(e)},
-            fix_hint="Riprova. Se persiste useremo Playwright headless."
-        )]
-        scans[scan_id].score = 0
-
-
-# ==========================
-# API ENDPOINTS
-# ==========================
-
-@app.post("/scan", response_model=ScanResult)
-async def start_scan(req: ScanRequest, tasks: BackgroundTasks):
-    scan_id = str(uuid.uuid4())
-    scans[scan_id] = ScanResult(scan_id=scan_id, status="pending")
-    tasks.add_task(run_scan, scan_id, str(req.url), req.depth)
-    return scans[scan_id]
+    # Mock results
+    scans[scan_id].status = "done"
+    scans[scan_id].score = 77
+    scans[scan_id].issues = [
+        Issue(
+            area="security",
+            severity="low",
+            title="Header di sicurezza mancanti",
+            evidence={"missing": ["Content-Security-Policy", "X-Content-Type-Options"]},
+            fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
+        ),
+        Issue(
+            area="policy",
+            severity="medium",
+            title="Informativa privacy trovata",
+            evidence={"found": ["finalita","diritti"], "missing": ["titolare","dpo"]},
+            fix_hint="Completa titolare, basi giuridiche, DPO, trasferimenti"
+        )
+    ]
 
 @app.get("/scan/{scan_id}", response_model=ScanResult)
 async def get_scan(scan_id: str):
@@ -126,35 +76,40 @@ async def get_scan(scan_id: str):
         raise HTTPException(status_code=404, detail="Scan not found")
     return scans[scan_id]
 
-@app.get("/report/{scan_id}")
+# 🔹 Generazione PDF report
+@app.get("/scan/{scan_id}/report")
 async def get_report(scan_id: str):
     if scan_id not in scans:
         raise HTTPException(status_code=404, detail="Scan not found")
     scan = scans[scan_id]
 
-    if scan.status != "done":
-        raise HTTPException(status_code=400, detail="Scan not completed")
+    file_path = f"/tmp/report_{scan_id}.pdf"
+    c = canvas.Canvas(file_path, pagesize=A4)
+    width, height = A4
 
-    # GENERA PDF
-    report_file = f"report_{scan_id}.pdf"
-    doc = SimpleDocTemplate(report_file, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
+    # Titolo
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(2*cm, height - 2*cm, f"GDPRCheck360 - Report Scansione")
+    c.setFont("Helvetica", 12)
+    c.drawString(2*cm, height - 3*cm, f"Scan ID: {scan.scan_id}")
+    c.drawString(2*cm, height - 4*cm, f"Stato: {scan.status}")
+    if scan.score is not None:
+        c.drawString(2*cm, height - 5*cm, f"Punteggio: {scan.score}")
 
-    story.append(Paragraph("📊 GDPRCheck360 – Report", styles["Title"]))
-    story.append(Spacer(1, 20))
-    story.append(Paragraph(f"<b>Scan ID:</b> {scan.scan_id}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Status:</b> {scan.status}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Score:</b> {scan.score}", styles["Normal"]))
-    story.append(Spacer(1, 20))
+    y = height - 7*cm
+    if scan.issues:
+        for issue in scan.issues:
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(2*cm, y, f"[{issue.severity.upper()}] {issue.title}")
+            y -= 0.5*cm
+            c.setFont("Helvetica", 10)
+            c.drawString(2.5*cm, y, f"Area: {issue.area}")
+            y -= 0.5*cm
+            c.drawString(2.5*cm, y, f"Fix: {issue.fix_hint}")
+            y -= 1*cm
+            if y < 3*cm:
+                c.showPage()
+                y = height - 2*cm
 
-    for issue in scan.issues or []:
-        story.append(Paragraph(f"<b>Area:</b> {issue.area}", styles["Heading3"]))
-        story.append(Paragraph(f"<b>Gravità:</b> {issue.severity}", styles["Normal"]))
-        story.append(Paragraph(f"<b>Titolo:</b> {issue.title}", styles["Normal"]))
-        story.append(Paragraph(f"<b>Fix:</b> {issue.fix_hint}", styles["Normal"]))
-        story.append(Spacer(1, 10))
-
-    doc.build(story)
-
-    return FileResponse(report_file, media_type="application/pdf", filename=report_file)
+    c.save()
+    return FileResponse(file_path, filename=f"gdpr_report_{scan_id}.pdf")
