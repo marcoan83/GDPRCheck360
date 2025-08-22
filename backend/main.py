@@ -1,12 +1,10 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Literal, List, Dict, Any
-import uuid, time, httpx, os
+import uuid, asyncio
 from bs4 import BeautifulSoup
-
-# ReportLab
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
@@ -17,6 +15,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
+
+# ✅ Healthcheck richiesto da Render
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse(content={"status": "ok"}, status_code=200)
 
 class ScanRequest(BaseModel):
     url: HttpUrl
@@ -35,7 +38,7 @@ class ScanResult(BaseModel):
     score: int | None = None
     issues: List[Issue] | None = None
 
-# 🔹 In-memory scans
+# In-memory scans
 scans: Dict[str, ScanResult] = {}
 
 @app.post("/scan/start", response_model=ScanResult)
@@ -49,8 +52,6 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 async def run_scan(scan_id: str, url: str, depth: str):
     scans[scan_id].status = "running"
     await asyncio.sleep(2)  # simulazione delay
-
-    # Mock results
     scans[scan_id].status = "done"
     scans[scan_id].score = 77
     scans[scan_id].issues = [
@@ -60,13 +61,6 @@ async def run_scan(scan_id: str, url: str, depth: str):
             title="Header di sicurezza mancanti",
             evidence={"missing": ["Content-Security-Policy", "X-Content-Type-Options"]},
             fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
-        ),
-        Issue(
-            area="policy",
-            severity="medium",
-            title="Informativa privacy trovata",
-            evidence={"found": ["finalita","diritti"], "missing": ["titolare","dpo"]},
-            fix_hint="Completa titolare, basi giuridiche, DPO, trasferimenti"
         )
     ]
 
@@ -76,7 +70,6 @@ async def get_scan(scan_id: str):
         raise HTTPException(status_code=404, detail="Scan not found")
     return scans[scan_id]
 
-# 🔹 Generazione PDF report
 @app.get("/scan/{scan_id}/report")
 async def get_report(scan_id: str):
     if scan_id not in scans:
@@ -87,7 +80,6 @@ async def get_report(scan_id: str):
     c = canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
 
-    # Titolo
     c.setFont("Helvetica-Bold", 18)
     c.drawString(2*cm, height - 2*cm, f"GDPRCheck360 - Report Scansione")
     c.setFont("Helvetica", 12)
