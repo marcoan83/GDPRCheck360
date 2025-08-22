@@ -1,12 +1,12 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from typing import Literal, List, Dict, Any
-import uuid, time
+from typing import Literal, List, Dict, Any, Tuple
+import uuid, time, re
 import httpx
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="GDPRCheck360 API", version="0.2.3")
+app = FastAPI(title="GDPRCheck360 API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +49,17 @@ TRACKER_HINTS = [
 
 CMP_HINTS = ["__tcfapi","__cmp","OneTrust","Didomi","Cookiebot","iubenda","Quantcast Choice"]
 
+POLICY_KEYS = {
+    "titolare": r"(titolare|controller)",
+    "finalita": r"(finalit[aà]|purpose)",
+    "basi": r"(base giuridic|legal basis)",
+    "conservazione": r"(conservazion|retent)",
+    "diritti": r"(diritti|rights.*access|rettifica|erasure|cancellazione)",
+    "dpo": r"\bdpo\b|data protection officer",
+    "trasferimenti": r"(trasferiment|transfer).*(extra|outside|eu|see|eea)",
+    "contatti": r"(contatt|contact).*privacy|email",
+}
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -67,6 +78,76 @@ def http_get(url: str) -> httpx.Response:
     ) as c:
         return c.get(url)
 
+def find_privacy_link(soup: BeautifulSoup, final_url: str) -> str | None:
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text() or "").lower()
+        href = (a["href"] or "").lower()
+        if "privacy" in text or "privacy" in href or "privacy-policy" in href:
+            try:
+                return str(httpx.URL(final_url).join(a["href"]))
+            except Exception:
+                return a["href"]
+    return None
+
+def validate_policy(url: str) -> Tuple[Dict[str, bool], int]:
+    """Ritorna mappa chiavi->presente e numero presenti."""
+    try:
+        r = http_get(url)
+        text = r.text[:800000].lower()
+    except Exception:
+        return {k: False for k in POLICY_KEYS}, 0
+    found = {}
+    for key, rx in POLICY_KEYS.items():
+        found[key] = bool(re.search(rx, text))
+    return found, sum(1 for v in found.values() if v)
+
+def analyze_forms(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    forms = soup.find_all("form")
+    for idx, f in enumerate(forms, start=1):
+        inputs = f.find_all(["input","textarea","select","button"])
+        names = " ".join([((i.get("name") or "") + " " + (i.get("id") or "")).lower() for i in inputs])
+        types = [ (i.get("type") or "").lower() for i in inputs if i.name=="input" ]
+
+        # 1) checkbox consenso preselezionate
+        for cb in [i for i in inputs if i.name=="input" and (i.get("type") or "").lower()=="checkbox"]:
+            n = (cb.get("name") or cb.get("id") or "").lower()
+            if any(k in n for k in ["marketing","newsletter","profil","consent","privacy"]) and cb.has_attr("checked"):
+                issues.append(Issue(
+                    area="forms", severity="high",
+                    title="Checkbox di consenso preselezionata",
+                    evidence={"form_index": idx, "name": n},
+                    fix_hint="Il consenso deve essere opt-in non preselezionato."
+                ))
+
+        # 2) mancanza informativa vicino al form
+        vicinity = (f.get_text(separator=" ", strip=True) or "").lower()
+        if "privacy" not in vicinity and "informativa" not in vicinity and "policy" not in vicinity:
+            issues.append(Issue(
+                area="forms", severity="medium",
+                title="Informativa non presente al punto di raccolta",
+                evidence={"form_index": idx, "sample_text": vicinity[:120]},
+                fix_hint="Inserisci un testo informativo o link privacy vicino al pulsante di invio."
+            ))
+
+        # 3) campi potenzialmente eccessivi su form base (euristico)
+        excessive = []
+        field_map = " ".join(types + [names])
+        if "codicefiscale" in field_map or "taxcode" in field_map:
+            excessive.append("codice fiscale")
+        if "birth" in field_map or "nascita" in field_map or "birthday" in field_map:
+            excessive.append("data di nascita")
+        if "phone" in field_map and "email" in field_map and ("newsletter" in field_map or "contact" in field_map):
+            excessive.append("telefono (verifica necessità)")
+        if excessive:
+            issues.append(Issue(
+                area="forms", severity="low",
+                title="Raccolta dati potenzialmente eccedente",
+                evidence={"form_index": idx, "fields": excessive},
+                fix_hint="Raccogli solo i dati necessari per la finalità dichiarata."
+            ))
+    return issues
+
 def analyze(url: str) -> List[Issue]:
     issues: List[Issue] = []
     target = url if url.startswith("http") else f"https://{url}"
@@ -84,7 +165,7 @@ def analyze(url: str) -> List[Issue]:
 
     final_url = str(resp.url)
     html = resp.text or ""
-    html_small = html[:500_000]
+    html_small = html[:600_000]
     headers = resp.headers
 
     # HTTPS
@@ -106,24 +187,19 @@ def analyze(url: str) -> List[Issue]:
             fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
         ))
 
-    # Privacy policy link
     soup = BeautifulSoup(html_small, "html.parser")
-    candidate = None
-    for a in soup.find_all("a", href=True):
-        text = (a.get_text() or "").lower()
-        href = a["href"].lower()
-        if "privacy" in text or "privacy" in href or "privacy-policy" in href:
-            try:
-                candidate = str(httpx.URL(final_url).join(a["href"]))
-            except Exception:
-                candidate = a["href"]
-            break
-    if candidate:
+
+    # Policy link + validazione minima
+    policy_url = find_privacy_link(soup, final_url)
+    if policy_url:
+        found_map, found_count = validate_policy(policy_url)
+        missing_keys = [k for k, ok in found_map.items() if not ok]
+        sev = "medium" if found_count >= 4 else "high"
         issues.append(Issue(
-            area="policy", severity="medium",
-            title="Informativa privacy trovata ma non validata",
-            evidence={"policy_url": candidate},
-            fix_hint="Controlla titolare, finalità, basi giuridiche, tempi, diritti, DPO, trasferimenti."
+            area="policy", severity=sev,
+            title="Informativa privacy trovata ma incompleta" if sev=="high" else "Informativa privacy trovata",
+            evidence={"policy_url": policy_url, "found": [k for k, ok in found_map.items() if ok], "missing": missing_keys},
+            fix_hint="Completa le sezioni mancanti: " + ", ".join(missing_keys) if missing_keys else "Verifica aggiornamento e chiarezza."
         ))
     else:
         issues.append(Issue(
@@ -151,6 +227,9 @@ def analyze(url: str) -> List[Issue]:
                 evidence={"cmp": found_cmp, "found_scripts": found_trackers},
                 fix_hint="Attiva script solo dopo consenso esplicito."
             ))
+
+    # Forms
+    issues.extend(analyze_forms(soup))
 
     return issues
 
