@@ -6,7 +6,7 @@ import uuid, time
 import httpx
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="GDPRCheck360 API", version="0.2.2")
+app = FastAPI(title="GDPRCheck360 API", version="0.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,6 +87,7 @@ def analyze(url: str) -> List[Issue]:
     html_small = html[:500_000]
     headers = resp.headers
 
+    # HTTPS
     if not final_url.startswith("https://"):
         issues.append(Issue(
             area="security", severity="high",
@@ -95,6 +96,7 @@ def analyze(url: str) -> List[Issue]:
             fix_hint="Forza HTTPS e redirect 301; certificato valido."
         ))
 
+    # Security headers
     missing = [h for h in SEC_HEADERS if h not in headers]
     if missing:
         issues.append(Issue(
@@ -104,13 +106,17 @@ def analyze(url: str) -> List[Issue]:
             fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
         ))
 
+    # Privacy policy link
     soup = BeautifulSoup(html_small, "html.parser")
     candidate = None
     for a in soup.find_all("a", href=True):
         text = (a.get_text() or "").lower()
         href = a["href"].lower()
         if "privacy" in text or "privacy" in href or "privacy-policy" in href:
-            candidate = httpx.URL(final_url).join(a["href"]).human_repr()
+            try:
+                candidate = str(httpx.URL(final_url).join(a["href"]))
+            except Exception:
+                candidate = a["href"]
             break
     if candidate:
         issues.append(Issue(
@@ -127,6 +133,7 @@ def analyze(url: str) -> List[Issue]:
             fix_hint="Aggiungi link privacy nel footer e nei punti di raccolta dati."
         ))
 
+    # Tracker + CMP
     found_trackers = [t for t in TRACKER_HINTS if t in html_small]
     found_cmp = [c for c in CMP_HINTS if c in html_small]
     if found_trackers:
@@ -183,4 +190,3 @@ def create_scan(req: ScanRequest, bg: BackgroundTasks):
 @app.get("/scan/{scan_id}", response_model=ScanResult)
 def get_scan(scan_id: str):
     return SCANS.get(scan_id) or ScanResult(scan_id=scan_id, status="error")
-    
