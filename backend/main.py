@@ -6,7 +6,7 @@ import uuid, time
 import httpx
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="GDPRCheck360 API", version="0.2.1")
+app = FastAPI(title="GDPRCheck360 API", version="0.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,7 +84,6 @@ def analyze(url: str) -> List[Issue]:
 
     final_url = str(resp.url)
     html = resp.text or ""
-    # limita dimensione per parser
     html_small = html[:500_000]
     headers = resp.headers
 
@@ -143,4 +142,45 @@ def analyze(url: str) -> List[Issue]:
                 area="cookies", severity="medium",
                 title="CMP rilevata. Verifica blocco preventivo",
                 evidence={"cmp": found_cmp, "found_scripts": found_trackers},
-                fix_hint="Attiva script
+                fix_hint="Attiva script solo dopo consenso esplicito."
+            ))
+
+    return issues
+
+def compute_score(issues: List[Issue]) -> int:
+    score = 100
+    for i in issues:
+        if i.severity == "high": score -= 20
+        elif i.severity == "medium": score -= 10
+        else: score -= 3
+    return max(0, min(100, score))
+
+def _run_real_scan(scan_id: str, target_url: str, depth: str):
+    SCANS[scan_id].status = "running"
+    try:
+        issues = analyze(target_url)
+        time.sleep(0.2)
+        SCANS[scan_id].issues = issues
+        SCANS[scan_id].score = compute_score(issues)
+        SCANS[scan_id].status = "done"
+    except Exception as e:
+        SCANS[scan_id].issues = [Issue(
+            area="security", severity="high",
+            title="Errore interno scanner",
+            evidence={"error": str(e)},
+            fix_hint="Riprova. Se persiste useremo Playwright headless."
+        )]
+        SCANS[scan_id].score = 0
+        SCANS[scan_id].status = "error"
+
+@app.post("/scan", response_model=ScanResult)
+def create_scan(req: ScanRequest, bg: BackgroundTasks):
+    scan_id = str(uuid.uuid4())
+    SCANS[scan_id] = ScanResult(scan_id=scan_id, status="pending")
+    bg.add_task(_run_real_scan, scan_id, str(req.url), req.depth)
+    return SCANS[scan_id]
+
+@app.get("/scan/{scan_id}", response_model=ScanResult)
+def get_scan(scan_id: str):
+    return SCANS.get(scan_id) or ScanResult(scan_id=scan_id, status="error")
+    
