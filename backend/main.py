@@ -1,10 +1,14 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from typing import Literal, List, Dict, Any, Tuple
-import uuid, time, re
+from typing import Literal, List, Dict, Any
+import uuid, time, os
 import httpx
 from bs4 import BeautifulSoup
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
 app = FastAPI(title="GDPRCheck360 API", version="0.3.0")
 
@@ -12,6 +16,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
+
+# ==========================
+# MODELS
+# ==========================
 
 class ScanRequest(BaseModel):
     url: HttpUrl
@@ -30,242 +38,123 @@ class ScanResult(BaseModel):
     score: int | None = None
     issues: List[Issue] | None = None
 
-SCANS: Dict[str, ScanResult] = {}
+# ==========================
+# STORAGE
+# ==========================
 
-SEC_HEADERS = [
-    "Strict-Transport-Security",
-    "Content-Security-Policy",
-    "X-Content-Type-Options",
-    "Referrer-Policy",
-    "Permissions-Policy",
-]
+scans: Dict[str, ScanResult] = {}
 
-TRACKER_HINTS = [
-    "googletagmanager.com","google-analytics.com","gtag/js",
-    "facebook.net","connect.facebook.net","fbq(",
-    "hotjar.com","static.hotjar.com","clarity.ms",
-    "segment.com","tracker.js","mixpanel.com",
-]
+# ==========================
+# SCAN FUNCTION
+# ==========================
 
-CMP_HINTS = ["__tcfapi","__cmp","OneTrust","Didomi","Cookiebot","iubenda","Quantcast Choice"]
-
-POLICY_KEYS = {
-    "titolare": r"(titolare|controller)",
-    "finalita": r"(finalit[aà]|purpose)",
-    "basi": r"(base giuridic|legal basis)",
-    "conservazione": r"(conservazion|retent)",
-    "diritti": r"(diritti|rights.*access|rettifica|erasure|cancellazione)",
-    "dpo": r"\bdpo\b|data protection officer",
-    "trasferimenti": r"(trasferiment|transfer).*(extra|outside|eu|see|eea)",
-    "contatti": r"(contatt|contact).*privacy|email",
-}
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "gdprcheck360-api"}
-
-def http_get(url: str) -> httpx.Response:
-    transport = httpx.HTTPTransport(retries=1)
-    with httpx.Client(
-        follow_redirects=True,
-        timeout=20.0,
-        headers={"User-Agent": "Mozilla/5.0 (GDPRCheck360)"},
-        transport=transport,
-    ) as c:
-        return c.get(url)
-
-def find_privacy_link(soup: BeautifulSoup, final_url: str) -> str | None:
-    for a in soup.find_all("a", href=True):
-        text = (a.get_text() or "").lower()
-        href = (a["href"] or "").lower()
-        if "privacy" in text or "privacy" in href or "privacy-policy" in href:
-            try:
-                return str(httpx.URL(final_url).join(a["href"]))
-            except Exception:
-                return a["href"]
-    return None
-
-def validate_policy(url: str) -> Tuple[Dict[str, bool], int]:
-    """Ritorna mappa chiavi->presente e numero presenti."""
-    try:
-        r = http_get(url)
-        text = r.text[:800000].lower()
-    except Exception:
-        return {k: False for k in POLICY_KEYS}, 0
-    found = {}
-    for key, rx in POLICY_KEYS.items():
-        found[key] = bool(re.search(rx, text))
-    return found, sum(1 for v in found.values() if v)
-
-def analyze_forms(soup: BeautifulSoup) -> List[Issue]:
+async def run_scan(scan_id: str, url: str, depth: str):
+    scans[scan_id].status = "running"
     issues: List[Issue] = []
-    forms = soup.find_all("form")
-    for idx, f in enumerate(forms, start=1):
-        inputs = f.find_all(["input","textarea","select","button"])
-        names = " ".join([((i.get("name") or "") + " " + (i.get("id") or "")).lower() for i in inputs])
-        types = [ (i.get("type") or "").lower() for i in inputs if i.name=="input" ]
-
-        # 1) checkbox consenso preselezionate
-        for cb in [i for i in inputs if i.name=="input" and (i.get("type") or "").lower()=="checkbox"]:
-            n = (cb.get("name") or cb.get("id") or "").lower()
-            if any(k in n for k in ["marketing","newsletter","profil","consent","privacy"]) and cb.has_attr("checked"):
-                issues.append(Issue(
-                    area="forms", severity="high",
-                    title="Checkbox di consenso preselezionata",
-                    evidence={"form_index": idx, "name": n},
-                    fix_hint="Il consenso deve essere opt-in non preselezionato."
-                ))
-
-        # 2) mancanza informativa vicino al form
-        vicinity = (f.get_text(separator=" ", strip=True) or "").lower()
-        if "privacy" not in vicinity and "informativa" not in vicinity and "policy" not in vicinity:
-            issues.append(Issue(
-                area="forms", severity="medium",
-                title="Informativa non presente al punto di raccolta",
-                evidence={"form_index": idx, "sample_text": vicinity[:120]},
-                fix_hint="Inserisci un testo informativo o link privacy vicino al pulsante di invio."
-            ))
-
-        # 3) campi potenzialmente eccessivi su form base (euristico)
-        excessive = []
-        field_map = " ".join(types + [names])
-        if "codicefiscale" in field_map or "taxcode" in field_map:
-            excessive.append("codice fiscale")
-        if "birth" in field_map or "nascita" in field_map or "birthday" in field_map:
-            excessive.append("data di nascita")
-        if "phone" in field_map and "email" in field_map and ("newsletter" in field_map or "contact" in field_map):
-            excessive.append("telefono (verifica necessità)")
-        if excessive:
-            issues.append(Issue(
-                area="forms", severity="low",
-                title="Raccolta dati potenzialmente eccedente",
-                evidence={"form_index": idx, "fields": excessive},
-                fix_hint="Raccogli solo i dati necessari per la finalità dichiarata."
-            ))
-    return issues
-
-def analyze(url: str) -> List[Issue]:
-    issues: List[Issue] = []
-    target = url if url.startswith("http") else f"https://{url}"
-
-    try:
-        resp = http_get(target)
-    except Exception as e:
-        issues.append(Issue(
-            area="security", severity="high",
-            title="Sito non raggiungibile",
-            evidence={"error": str(e), "url": target},
-            fix_hint="Verifica DNS, certificato, WAF o rate limit. Riprova con Playwright in futuro."
-        ))
-        return issues
-
-    final_url = str(resp.url)
-    html = resp.text or ""
-    html_small = html[:600_000]
-    headers = resp.headers
-
-    # HTTPS
-    if not final_url.startswith("https://"):
-        issues.append(Issue(
-            area="security", severity="high",
-            title="Connessione non protetta (HTTPS mancante)",
-            evidence={"final_url": final_url},
-            fix_hint="Forza HTTPS e redirect 301; certificato valido."
-        ))
-
-    # Security headers
-    missing = [h for h in SEC_HEADERS if h not in headers]
-    if missing:
-        issues.append(Issue(
-            area="security", severity="low",
-            title="Header di sicurezza mancanti",
-            evidence={"missing": missing},
-            fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
-        ))
-
-    soup = BeautifulSoup(html_small, "html.parser")
-
-    # Policy link + validazione minima
-    policy_url = find_privacy_link(soup, final_url)
-    if policy_url:
-        found_map, found_count = validate_policy(policy_url)
-        missing_keys = [k for k, ok in found_map.items() if not ok]
-        sev = "medium" if found_count >= 4 else "high"
-        issues.append(Issue(
-            area="policy", severity=sev,
-            title="Informativa privacy trovata ma incompleta" if sev=="high" else "Informativa privacy trovata",
-            evidence={"policy_url": policy_url, "found": [k for k, ok in found_map.items() if ok], "missing": missing_keys},
-            fix_hint="Completa le sezioni mancanti: " + ", ".join(missing_keys) if missing_keys else "Verifica aggiornamento e chiarezza."
-        ))
-    else:
-        issues.append(Issue(
-            area="policy", severity="high",
-            title="Informativa privacy non rilevata",
-            evidence={"page": final_url},
-            fix_hint="Aggiungi link privacy nel footer e nei punti di raccolta dati."
-        ))
-
-    # Tracker + CMP
-    found_trackers = [t for t in TRACKER_HINTS if t in html_small]
-    found_cmp = [c for c in CMP_HINTS if c in html_small]
-    if found_trackers:
-        if not found_cmp:
-            issues.append(Issue(
-                area="cookies", severity="high",
-                title="Tracker di terze parti senza CMP rilevata",
-                evidence={"url": final_url, "found_scripts": found_trackers},
-                fix_hint="Integra CMP TCF 2.2 con blocco preventivo."
-            ))
-        else:
-            issues.append(Issue(
-                area="cookies", severity="medium",
-                title="CMP rilevata. Verifica blocco preventivo",
-                evidence={"cmp": found_cmp, "found_scripts": found_trackers},
-                fix_hint="Attiva script solo dopo consenso esplicito."
-            ))
-
-    # Forms
-    issues.extend(analyze_forms(soup))
-
-    return issues
-
-def compute_score(issues: List[Issue]) -> int:
     score = 100
-    for i in issues:
-        if i.severity == "high": score -= 20
-        elif i.severity == "medium": score -= 10
-        else: score -= 3
-    return max(0, min(100, score))
 
-def _run_real_scan(scan_id: str, target_url: str, depth: str):
-    SCANS[scan_id].status = "running"
     try:
-        issues = analyze(target_url)
-        time.sleep(0.2)
-        SCANS[scan_id].issues = issues
-        SCANS[scan_id].score = compute_score(issues)
-        SCANS[scan_id].status = "done"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
+
+            # SECURITY HEADERS
+            missing_headers = []
+            for h in ["Strict-Transport-Security", "Content-Security-Policy",
+                      "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy"]:
+                if h not in resp.headers:
+                    missing_headers.append(h)
+            if missing_headers:
+                issues.append(Issue(
+                    area="security", severity="low",
+                    title="Header di sicurezza mancanti",
+                    evidence={"missing": missing_headers},
+                    fix_hint="Imposta HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."
+                ))
+                score -= 10
+
+            # PRIVACY POLICY
+            if soup.find("a", href=lambda x: x and "privacy" in x.lower()):
+                issues.append(Issue(
+                    area="policy", severity="medium",
+                    title="Informativa privacy trovata ma non validata",
+                    evidence={"policy_url": url + "/privacy"},
+                    fix_hint="Controlla titolare, finalità, basi giuridiche, tempi, diritti, DPO, trasferimenti."
+                ))
+                score -= 15
+
+            # CMP / COOKIE BANNER
+            if "cookie" in html.lower():
+                issues.append(Issue(
+                    area="cookies", severity="medium",
+                    title="CMP rilevata. Verifica blocco preventivo",
+                    evidence={"url": url},
+                    fix_hint="Attiva script solo dopo consenso esplicito."
+                ))
+                score -= 10
+
+        scans[scan_id].issues = issues
+        scans[scan_id].score = max(0, score)
+        scans[scan_id].status = "done"
+
     except Exception as e:
-        SCANS[scan_id].issues = [Issue(
+        scans[scan_id].status = "error"
+        scans[scan_id].issues = [Issue(
             area="security", severity="high",
             title="Errore interno scanner",
             evidence={"error": str(e)},
             fix_hint="Riprova. Se persiste useremo Playwright headless."
         )]
-        SCANS[scan_id].score = 0
-        SCANS[scan_id].status = "error"
+        scans[scan_id].score = 0
+
+
+# ==========================
+# API ENDPOINTS
+# ==========================
 
 @app.post("/scan", response_model=ScanResult)
-def create_scan(req: ScanRequest, bg: BackgroundTasks):
+async def start_scan(req: ScanRequest, tasks: BackgroundTasks):
     scan_id = str(uuid.uuid4())
-    SCANS[scan_id] = ScanResult(scan_id=scan_id, status="pending")
-    bg.add_task(_run_real_scan, scan_id, str(req.url), req.depth)
-    return SCANS[scan_id]
+    scans[scan_id] = ScanResult(scan_id=scan_id, status="pending")
+    tasks.add_task(run_scan, scan_id, str(req.url), req.depth)
+    return scans[scan_id]
 
 @app.get("/scan/{scan_id}", response_model=ScanResult)
-def get_scan(scan_id: str):
-    return SCANS.get(scan_id) or ScanResult(scan_id=scan_id, status="error")
+async def get_scan(scan_id: str):
+    if scan_id not in scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return scans[scan_id]
+
+@app.get("/report/{scan_id}")
+async def get_report(scan_id: str):
+    if scan_id not in scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    scan = scans[scan_id]
+
+    if scan.status != "done":
+        raise HTTPException(status_code=400, detail="Scan not completed")
+
+    # GENERA PDF
+    report_file = f"report_{scan_id}.pdf"
+    doc = SimpleDocTemplate(report_file, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("📊 GDPRCheck360 – Report", styles["Title"]))
+    story.append(Spacer(1, 20))
+    story.append(Paragraph(f"<b>Scan ID:</b> {scan.scan_id}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Status:</b> {scan.status}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Score:</b> {scan.score}", styles["Normal"]))
+    story.append(Spacer(1, 20))
+
+    for issue in scan.issues or []:
+        story.append(Paragraph(f"<b>Area:</b> {issue.area}", styles["Heading3"]))
+        story.append(Paragraph(f"<b>Gravità:</b> {issue.severity}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Titolo:</b> {issue.title}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Fix:</b> {issue.fix_hint}", styles["Normal"]))
+        story.append(Spacer(1, 10))
+
+    doc.build(story)
+
+    return FileResponse(report_file, media_type="application/pdf", filename=report_file)
